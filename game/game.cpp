@@ -166,24 +166,31 @@ void game_show_title()
 //  game_update() — Mise à jour logique du jeu
 // ============================================================================
 void game_update() {
+	// Réinitialiser les flags à chaque frame
     g_state.hasWon  = false;
     g_state.hasDied = false;
 
-    // Déplacement
+    // Lecture des entrées directionnelles
     int dx = 0, dy = 0;
     if (g_keys.left)  dx = -1;
-    if (g_keys.right) dx = +1;
-    if (g_keys.up)    dy = -1;
-    if (g_keys.down)  dy = +1;
+    else if (g_keys.right) dx = +1;
+    else if (g_keys.up)    dy = -1;
+    else if (g_keys.down)  dy = +1;
 
+    // Déplacement si demandé
     if (dx != 0 || dy != 0) {
+		// step() : snapshot → push → move → effects
         MoveResult r = step(g_state.grid, g_state.props, dx, dy);
+		
+		// Recalcul des règles après chaque mouvement
         rules_parse(g_state.grid, g_state.props);
+		
+		// Mettre à jour les flags
         g_state.hasWon  = r.hasWon;
         g_state.hasDied = r.hasDied;
     }
 
-    // Caméra : joystick libre (joyX/joyY normalisés dans Keys)
+    // Mise à jour caméra (toujours, même si pas de déplacement)
     update_camera(g_state.grid, g_state.props, g_keys.joyX, g_keys.joyY);
 }
 
@@ -223,11 +230,21 @@ void game_draw() {
         for (int x = camTileX; x < endX; ++x) {
             int screenX = (x - g_camera.x) * TILE_SIZE;
             int screenY = (y - g_camera.y) * TILE_SIZE;
+
+            // Test si la case est dans la zone jouable
+            if (!g_state.grid.in_play_area(x, y)) {
+                // Dessine une tuile grise (fond gris)
+                gfx_fillRect(screenX, screenY, TILE_SIZE, TILE_SIZE, 0x8410); 
+                continue; // ne dessine pas d’objets
+            }
+
+            // Sinon, dessine normalement
             draw_cell(screenX, screenY, g_state.grid.cell(x, y));
         }
     }
 
     gfx_flush();
 }
+
 
 } // namespace baba

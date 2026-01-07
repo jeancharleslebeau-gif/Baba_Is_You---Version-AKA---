@@ -63,6 +63,9 @@ void gfx_text_center(int y, const char* text, uint16_t color);
 // Largeur d’un caractère (police monospaced)
 int gfx_char_width(char c);
 
+// Dessine un rectangle coloré
+void gfx_fillRect(int x, int y, int w, int h, uint16_t color);
+
 // Instance héritée (compatibilité)
 extern graphics_basic gfx;
 

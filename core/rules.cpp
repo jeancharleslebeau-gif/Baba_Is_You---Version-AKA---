@@ -134,12 +134,19 @@ void apply_status(Properties& p, ObjectType s) {
 // ============================================================================
 /*
     rules_reset() :
-      Remet toutes les propriétés à false.
+      Remet toutes les propriétés à false sauf les mots toujours déplaçables par défaut
 */
 void rules_reset(PropertyTable& table) {
-    for (auto& p : table)
-        p = Properties{};
+    for (size_t i = 0; i < table.size(); i++) {
+        table[i] = Properties{};
+
+        // ✅ Les mots TEXT_* sont toujours PUSH
+        if (is_word((ObjectType)i)) {
+            table[i].isPush = true;
+        }
+    }
 }
+
 
 // ============================================================================
 //  Analyse la grille et extrait les règles actives

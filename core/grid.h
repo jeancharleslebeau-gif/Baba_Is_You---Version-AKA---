@@ -103,9 +103,9 @@ struct Cell {
 // -----------------------------------------------------------------------------
 //  Grille complète
 // -----------------------------------------------------------------------------
+
 struct Grid {
-    int width;
-    int height;
+    int width, height;
     std::vector<Cell> cells;
 
     Grid(int w = MAP_WIDTH, int h = MAP_HEIGHT);
@@ -116,6 +116,14 @@ struct Grid {
 
     // Vérifie si une coordonnée est dans la grille
     bool in_bounds(int x, int y) const;
+	
+	
+    int playMinX = 0, playMinY = 0;
+    int playMaxX = 0, playMaxY = 0; // inclusifs
+
+    bool in_play_area(int x, int y) const {
+        return (x >= playMinX && x <= playMaxX && y >= playMinY && y <= playMaxY);
+    }
 };
 
 

@@ -32,6 +32,7 @@
       gfx_text()
       gfx_text_center()
       gfx_drawAtlas()
+	  gfx_fillRect()
 
   Auteur : Jean-Charles LEBEAU
   Date   : Janvier 2026
@@ -143,6 +144,22 @@ void gfx_putpixel16(int x, int y, uint16_t color) {
     gfx_direct_putpixel(x, y, color);
 #endif
 }
+
+
+void gfx_fillRect(int x, int y, int w, int h, uint16_t color)
+{
+    for (int yy = y; yy < y + h; ++yy) {
+        for (int xx = x; xx < x + w; ++xx) {
+#if USE_FRAMEBUFFER
+            gfx_fb_putpixel(xx, yy, color);
+#else
+            gfx_direct_putpixel(xx, yy, color);
+#endif
+        }
+    }
+}
+
+
 
 
 // ============================================================================

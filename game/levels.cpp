@@ -41,25 +41,32 @@ namespace baba {
     4. Copie les objets dans la grille logique.
 ===============================================================================
 */
+
 void load_level(int index, Grid& g)
 {
-    // Grille logique (32×24)
+	// Grille logique (32×24)
     g = Grid(MAP_WIDTH, MAP_HEIGHT);
 
     const LevelInfo& info = levels[index];
 
-    // Calcul du décalage pour centrer le niveau
+	// Calcul du décalage pour centrer le niveau
     int offsetX = (MAP_WIDTH  - info.width)  / 2;
     int offsetY = (MAP_HEIGHT - info.height) / 2;
+
+    // Définir la zone jouable
+    g.playMinX = offsetX;
+    g.playMinY = offsetY;
+    g.playMaxX = offsetX + info.width  - 1;
+    g.playMaxY = offsetY + info.height - 1;
 
     for (int y = 0; y < info.height; ++y) {
         for (int x = 0; x < info.width; ++x) {
             uint8_t code = info.data[y * info.width + x];
             if (code == EMPTY) continue;
-
             g.cell(offsetX + x, offsetY + y).objects.push_back({static_cast<ObjectType>(code)});
         }
     }
 }
+
 
 } // namespace baba
