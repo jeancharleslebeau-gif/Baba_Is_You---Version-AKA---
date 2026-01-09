@@ -29,6 +29,11 @@ void gfx_fb_init();                 // Initialise LCD + DMA + framebuffer
 void gfx_fb_clear(uint16_t color);  // Efface framebuffer[]
 void gfx_fb_flush();                // Envoie framebuffer → LCD (DMA)
 
+// ============================================================================
+// Encadre un cycle de rendu complet 
+// ============================================================================
+void gfx_begin_frame(); 
+void gfx_end_frame();
 
 // ============================================================================
 //  PIXELS
@@ -148,3 +153,4 @@ void gfx_fb_fadeToColor(uint16_t color, int steps);
 // ============================================================================
 void gfx_fb_debugRect(int x, int y, int w, int h, uint16_t color);
 void gfx_fb_debugPoint(int x, int y, uint16_t color);
+void gfx_fb_debugStatus();				// Affiche l’état debug (flush, skipped, last_delta) 

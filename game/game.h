@@ -33,11 +33,11 @@ namespace baba {
 ===============================================================================
 */
 struct GameState {
-    Grid grid;              // Grille de jeu (objets et mots)
-    PropertyTable props;    // Propriétés dynamiques (YOU, PUSH, STOP, etc.)
-    bool hasWon  = false;   // Flag de victoire
-    bool hasDied = false;   // Flag de mort
-	int currentLevel = 0; 	// Niveau courant (pour restart/advance)
+    Grid grid;                // Grille de jeu (objets et mots)
+    PropertyTable props;      // Propriétés dynamiques (YOU, PUSH, STOP, etc.)
+    bool hasWon  = false;     // Flag de victoire
+    bool hasDied = false;     // Flag de mort
+	int currentLevel = 0; 	  // Niveau courant (pour restart/advance)
 };
 
 /*

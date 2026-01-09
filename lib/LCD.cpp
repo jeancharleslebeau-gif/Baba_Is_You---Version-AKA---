@@ -2,29 +2,27 @@
 //  LCD.cpp — Pilote ST7789 (bus i80 + DMA) pour écran 320×240 RGB565
 // ============================================================================
 //
-//  Rôle :
+//  Rôle principal :
 //    - Initialiser le bus i80 et le contrôleur LCD ST7789
-//    - Gérer le framebuffer 320×240 (RGB565)
+//    - Gérer un framebuffer unique (single-buffer) en RAM interne
 //    - Fournir des primitives bas niveau : pixels, texte, scrolling
-//    - Gérer un pipeline DMA propre : lcd_wait_for_dma / lcd_wait_for_vsync
-//      / lcd_start_dma / lcd_refresh
+//    - Gérer un pipeline DMA robuste avec verrouillage et pacing
 //
 //  Notes importantes :
-//    - Le framebuffer complet (153600 octets) est en RAM interne.
-//    - Les transferts DMA sont faits par bandes (ex. 40 lignes) pour limiter
-//      la taille de buffer et la consommation mémoire.
-//    - La profondeur de queue DMA est réduite (2–4) pour éviter les erreurs
-//      "create done queue failed".
-//    - Tout le reste (API, helpers, texte, logo, console) est inchangé.
+//    - Framebuffer complet : 320 × 240 × 2 octets ≈ 153600 octets
+//    - Allocation DMA-capable obligatoire
+//    - Transferts DMA par bandes (40 lignes) pour limiter la taille
+//    - Flag global g_dma_active interdit toute écriture pendant DMA
+//    - Pacing minimal (16 ms) pour éviter tearing et saturations
 // ============================================================================
 
 #include "LCD.h"
 #include "expander.h"
 #include "core/graphics.h"
 
-#include <string.h>     // memcpy, memset
-#include <stdio.h>      // printf
-#include <stdarg.h>     // va_list, vsnprintf
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 #include <esp_lcd_panel_io.h>
 #include "esp_lcd_io_i80.h"
@@ -36,24 +34,31 @@
 #include "esp_timer.h"
 #include "hal/lcd_types.h"
 #include "esp_heap_caps.h"
+#include "game/config.h"
 
 // ============================================================================
 //  Framebuffer
 // ============================================================================
-uint16_t framebuffer[320 * 240];
+uint16_t* framebuffer       = nullptr;		// buffer unique DMA-capable
+volatile bool g_dma_active  = false;		// verrou global : interdit écriture pendant DMA
+
+void LCD_init_buffers()
+{
+    framebuffer = (uint16_t*) heap_caps_malloc(
+        SCREEN_W * SCREEN_H * sizeof(uint16_t),
+        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+    );
+    if (!framebuffer) {
+        printf("FATAL: framebuffer alloc failed\n");
+        for (;;) vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
 
 // ============================================================================
 //  Helpers système
 // ============================================================================
-static void delay_ms(uint32_t ms)
-{
-    vTaskDelay(ms / portTICK_PERIOD_MS);
-}
-
-IRAM_ATTR uint32_t millis()
-{
-    return xTaskGetTickCount() * 1000 / portTICK_PERIOD_MS;
-}
+static void delay_ms(uint32_t ms) { vTaskDelay(ms / portTICK_PERIOD_MS); }
+IRAM_ATTR uint32_t millis() { return xTaskGetTickCount() * 1000 / portTICK_PERIOD_MS; }
 
 // ============================================================================
 //  État du pipeline DMA
@@ -69,50 +74,29 @@ volatile uint32_t u32_refresh_ctr   = 0;
 esp_lcd_i80_bus_handle_t i80_bus = nullptr;
 esp_lcd_panel_io_handle_t lcd_panel_h = nullptr;
 
-// Bus configuration (ajusté: transfert par bandes)
 static esp_lcd_i80_bus_config_t bus_config = {
     .dc_gpio_num = LCD_PIN_DnC,
     .wr_gpio_num = LCD_PIN_nWR,
     .clk_src     = LCD_CLK_SRC_PLL160M,
-    .data_gpio_nums = {
-        LCD_PIN_DB0,
-        LCD_PIN_DB1,
-        LCD_PIN_DB2,
-        LCD_PIN_DB3,
-        LCD_PIN_DB4,
-        LCD_PIN_DB5,
-        LCD_PIN_DB6,
-        LCD_PIN_DB7,
-    },
+    .data_gpio_nums = { LCD_PIN_DB0,LCD_PIN_DB1,LCD_PIN_DB2,LCD_PIN_DB3,
+                        LCD_PIN_DB4,LCD_PIN_DB5,LCD_PIN_DB6,LCD_PIN_DB7 },
     .bus_width           = 8,
-    // IMPORTANT: on limite la taille d’un transfert pour éviter l’allocation massive
-    .max_transfer_bytes  = 320 * 40 * sizeof(uint16_t), // bande de 40 lignes
+    .max_transfer_bytes  = 320 * 40 * sizeof(uint16_t),
     .psram_trans_align   = 64,
     .sram_trans_align    = 64,
 };
 
-// Panel IO config (DMA) — ajusté: queue et fréquence
 esp_lcd_panel_io_i80_config_t panel_config = {
     .cs_gpio_num = -1,
-    .pclk_hz     = 8000000,       // démarre à 8 MHz (fiable), on pourra augmenter ensuite
-    .trans_queue_depth = 4,       // queue réduite pour limiter la RAM
+    .pclk_hz     = 8000000,		  // fréquence initiale fiable	
+    .trans_queue_depth = 2,       // réduit pour éviter files concurrentes
     .on_color_trans_done = nullptr,
     .user_ctx    = nullptr,
     .lcd_cmd_bits   = 8,
     .lcd_param_bits = 8,
-    .dc_levels = {
-        .dc_idle_level   = 1,
-        .dc_cmd_level    = 0,
-        .dc_dummy_level  = 1,
-        .dc_data_level   = 1
-    },
-    .flags = {
-        .cs_active_high   = 0,
-        .reverse_color_bits = 0,
-        .swap_color_bytes = 1,
-        .pclk_active_neg  = 0,
-        .pclk_idle_low    = 0
-    }
+    .dc_levels = {1,0,1,1},
+    .flags = {.cs_active_high=0,.reverse_color_bits=0,.swap_color_bytes=1,
+              .pclk_active_neg=0,.pclk_idle_low=0}
 };
 
 // ============================================================================
@@ -122,15 +106,114 @@ IRAM_ATTR bool color_trans_done_cb(esp_lcd_panel_io_handle_t,
                                    esp_lcd_panel_io_event_data_t*,
                                    void*)
 {
+    g_dma_active = false;
     uint32_t now = millis();
-    if (u32_start_refresh != 0) {
-        u32_delta_refresh = now - u32_start_refresh;
-    } else {
-        u32_delta_refresh = 0;
-    }
-    u32_refresh_ctr++;
+    u32_delta_refresh = (u32_start_refresh != 0) ? (now - u32_start_refresh) : 0;
+    u32_refresh_ctr = u32_refresh_ctr + 1;
     u32_start_refresh = 0;
     return false;
+}
+
+// ============================================================================
+//  Transfert DMA rapide (par bandes)
+// ============================================================================
+void LCD_FAST_test(const uint16_t* buf)
+{
+    u32_start_refresh = millis();
+    g_dma_active = true;
+
+    const int lineBytes = 320 * sizeof(uint16_t);
+    const int bandLines = 40;
+
+    for (int y = 0; y < 240; y += bandLines) {
+        int lines = (y + bandLines <= 240) ? bandLines : (240 - y);
+        const uint16_t* src = buf + y * 320;
+
+        uint8_t x_coord[4] = {0,0,1,0x3F};
+        uint8_t y_coord[4] = {(uint8_t)(y >> 8),(uint8_t)y,
+                              (uint8_t)((y+lines-1)>>8),(uint8_t)(y+lines-1)};
+        esp_lcd_panel_io_tx_param(lcd_panel_h, ST7789V_CMD_CASET, x_coord, 4);
+        esp_lcd_panel_io_tx_param(lcd_panel_h, ST7789V_CMD_RASET, y_coord, 4);
+
+        esp_lcd_panel_io_tx_color(lcd_panel_h, ST7789V_CMD_RAMWR, src, lines * lineBytes);
+    }
+}
+
+// ============================================================================
+//  Pipeline DMA propre
+// ============================================================================
+void lcd_wait_for_dma()
+{
+    static uint32_t last_seen = 0;
+    while ((u32_refresh_ctr == last_seen) || g_dma_active) {
+        taskYIELD();
+    }
+    last_seen = u32_refresh_ctr;
+}
+
+void lcd_wait_for_vsync()
+{
+#ifdef USE_VSYNC
+    uint64_t start_us = esp_timer_get_time();
+    while (digitalRead(LCD_FMARK)) {
+        if ((esp_timer_get_time() - start_us) > 20000) return;
+    }
+    start_us = esp_timer_get_time();
+    while (!digitalRead(LCD_FMARK)) {
+        if ((esp_timer_get_time() - start_us) > 20000) return;
+    }
+#endif
+}
+
+void lcd_start_dma()
+{
+    if (!framebuffer) return;
+    u32_draw_count = u32_draw_count + 1;
+    LCD_FAST_test(framebuffer);
+}
+
+uint8_t lcd_refresh_completed()
+{
+    static uint32_t last_seen = 0;
+    if (u32_refresh_ctr != last_seen) {
+        last_seen = u32_refresh_ctr;
+        return 1;
+    }
+    return 0;
+}
+
+
+void lcd_refresh()
+{
+    static uint32_t last_flush_ms = 0;
+    const uint32_t min_frame_ms = 16; // ~60 fps
+
+    lcd_wait_for_dma();
+    lcd_wait_for_vsync();
+
+    uint32_t now = millis();
+    if (now - last_flush_ms < min_frame_ms) {
+        vTaskDelay((min_frame_ms - (now - last_flush_ms)) / portTICK_PERIOD_MS);
+    }
+    last_flush_ms = millis();
+
+    lcd_start_dma();
+}
+
+// ============================================================================
+//  Pixel protégé
+// ============================================================================
+inline void guarded_putpixel(uint16_t x, uint16_t y, uint16_t color) {
+    if (g_dma_active) {
+        lcd_wait_for_dma();
+        lcd_wait_for_vsync();
+    }
+    framebuffer[y * SCREEN_W + x] = color;
+}
+
+void lcd_putpixel(uint16_t x, uint16_t y, uint16_t color)
+{
+    if (x < 320 && y < 240) guarded_putpixel(x,y,color);
 }
 
 // ============================================================================
@@ -378,31 +461,6 @@ static void LCD_SLOW_test(const uint16_t* buffer)
     }
 }
 
-// ============================================================================
-//  Transfert DMA rapide (par bandes)
-// ============================================================================
-void LCD_FAST_test(const uint16_t* buf)
-{
-    u32_start_refresh = millis();
-
-    const int lineBytes = 320 * sizeof(uint16_t);
-    const int bandLines = 40; // aligne avec bus_config.max_transfer_bytes
-    // On itère par bandes verticales
-    for (int y = 0; y < 240; y += bandLines) {
-        int lines = (y + bandLines <= 240) ? bandLines : (240 - y);
-        const uint16_t* src = buf + y * 320;
-
-        // Fenêtre pour la bande
-        uint8_t x_coord[4] = {0, 0, 1, 0x3F}; // 0..319
-        uint8_t y_coord[4] = {(uint8_t)(y >> 8), (uint8_t)y,
-                              (uint8_t)((y+lines-1) >> 8), (uint8_t)(y+lines-1)};
-        esp_lcd_panel_io_tx_param(lcd_panel_h, ST7789V_CMD_CASET, x_coord, 4);
-        esp_lcd_panel_io_tx_param(lcd_panel_h, ST7789V_CMD_RASET, y_coord, 4);
-
-        // Transfert couleur de la bande
-        esp_lcd_panel_io_tx_color(lcd_panel_h, ST7789V_CMD_RAMWR, src, lines * lineBytes);
-    }
-}
 
 uint32_t LCD_last_refresh_delay()
 {
@@ -427,61 +485,7 @@ static uint8_t lcd_read_scanline()
     return ret;
 }
 
-// ============================================================================
-//  Pipeline DMA propre
-// ============================================================================
-void lcd_wait_for_dma()
-{
-    static uint32_t last_seen = 0;
 
-    while (u32_refresh_ctr == last_seen) {
-        taskYIELD();
-    }
-
-    last_seen = u32_refresh_ctr;
-}
-
-void lcd_wait_for_vsync()
-{
-#ifdef USE_VSYCNC
-    uint64_t start_us = esp_timer_get_time();
-
-    // Attendre front descendant
-    while (digitalRead(LCD_FMARK)) {
-        if ((esp_timer_get_time() - start_us) > 20000) {
-            printf("ERROR : Loop scanline 1 timeout\n");
-            return;
-        }
-    }
-
-    // Attendre front montant
-    start_us = esp_timer_get_time();
-    while (!digitalRead(LCD_FMARK)) {
-        if ((esp_timer_get_time() - start_us) > 20000) {
-            printf("ERROR : Loop scanline 0 timeout\n");
-            return;
-        }
-    }
-#endif
-}
-
-void lcd_start_dma()
-{
-    u32_draw_count = u32_draw_count + 1;
-    LCD_FAST_test(framebuffer);
-}
-
-uint8_t lcd_refresh_completed()
-{
-    return (uint8_t)u32_refresh_ctr;
-}
-
-void lcd_refresh()
-{
-    lcd_wait_for_dma();
-    lcd_wait_for_vsync();
-    lcd_start_dma();
-}
 
 // ============================================================================
 //  Couleurs, palette, FPS
@@ -525,6 +529,9 @@ void LCD_init()
     printf("LCD_i80_bus_init()\n");
     LCD_i80_bus_init();
 
+    // ⚠️ Allouer les buffers AVANT d’utiliser lcd_clear ou lancer le DMA
+    LCD_init_buffers();
+
     ILI9342C_hard_reset();
 
     ILI9342C_write_cmd(ST7789V_CMD_RESET, nullptr, 0);
@@ -559,7 +566,6 @@ void LCD_init()
         // logo centré
         int16_t x = (320 - 80) / 2;
         // dessine le logo en bitmap 1-bit
-        // (fonction définie plus bas)
         extern void lcd_drawBitmap(int16_t x, int16_t y,
                                    const uint8_t* bitmap,
                                    uint16_t color);
@@ -573,6 +579,7 @@ void LCD_init()
     lcd_set_fps(40); // FPS par défaut pour le jeu
 }
 
+
 // ============================================================================
 //  Texte (font8x8_basic)
 // ============================================================================
@@ -580,14 +587,6 @@ void LCD_init()
 
 // Couleur de texte globale (définie dans graphics.cpp)
 extern uint16_t current_text_color;
-
-void lcd_putpixel(uint16_t x, uint16_t y, uint16_t color)
-{
-    uint32_t offset = x + y * 320;
-    if (offset < 320 * 240) {
-        framebuffer[offset] = color;
-    }
-}
 
 void lcd_draw_char(uint16_t x, uint16_t y, char c)
 {

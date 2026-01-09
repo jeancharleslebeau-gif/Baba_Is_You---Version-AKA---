@@ -69,6 +69,21 @@ void gfx_fillRect(int x, int y, int w, int h, uint16_t color);
 // Instance héritée (compatibilité)
 extern graphics_basic gfx;
 
+// graphics_utils.h
+inline uint16_t darken(uint16_t color, float factor) {
+    // factor entre 0.0 (pas de fade) et 1.0 (noir complet)
+    // Format RGB565 : 5 bits R, 6 bits G, 5 bits B
+    uint8_t r = (color >> 11) & 0x1F;
+    uint8_t g = (color >> 5)  & 0x3F;
+    uint8_t b =  color        & 0x1F;
+
+    r = (uint8_t)(r * (1.0f - factor));
+    g = (uint8_t)(g * (1.0f - factor));
+    b = (uint8_t)(b * (1.0f - factor));
+
+    return (r << 11) | (g << 5) | b;
+}
+
 // -----------------------------------------------------------------------------
 // API BAS NIVEAU — utilisée par certains modules internes
 // -----------------------------------------------------------------------------

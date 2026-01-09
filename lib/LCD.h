@@ -3,6 +3,7 @@
 #define __LCD_H_
 
 #include "common.h"
+#include "game/config.h"
 #include <stdint.h>
 
 /*
@@ -25,6 +26,7 @@ Ce module fournit :
 ===============================================================================
 */
 
+uint32_t millis();
 
 // ============================================================================
 //  Commandes ST7789
@@ -56,9 +58,13 @@ Ce module fournit :
 
 
 // ============================================================================
-//  Framebuffer global (défini dans LCD.cpp)
+//  Framebuffers globaux (défini dans LCD.cpp)
 // ============================================================================
-extern uint16_t framebuffer[320 * 240];
+// Pointers, not fixed-size arrays
+extern uint16_t* framebuffer;       // front (DMA-capable, internal DRAM)
+
+// Initialize both buffers
+void LCD_init_buffers();
 
 
 // ============================================================================

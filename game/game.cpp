@@ -231,20 +231,18 @@ void game_draw() {
             int screenX = (x - g_camera.x) * TILE_SIZE;
             int screenY = (y - g_camera.y) * TILE_SIZE;
 
-            // Test si la case est dans la zone jouable
             if (!g_state.grid.in_play_area(x, y)) {
-                // Dessine une tuile grise (fond gris)
-                gfx_fillRect(screenX, screenY, TILE_SIZE, TILE_SIZE, 0x8410); 
-                continue; // ne dessine pas d’objets
+                gfx_fillRect(screenX, screenY, TILE_SIZE, TILE_SIZE, 0x8410);
+                continue;
             }
 
-            // Sinon, dessine normalement
             draw_cell(screenX, screenY, g_state.grid.cell(x, y));
         }
     }
 
     gfx_flush();
 }
+
 
 
 } // namespace baba

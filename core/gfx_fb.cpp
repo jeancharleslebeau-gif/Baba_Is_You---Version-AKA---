@@ -1,20 +1,18 @@
-	// ============================================================================
-//  gfx_fb.cpp — Backend graphique FRAMEBUFFER (DMA → LCD)
+// ============================================================================
+//  gfx_fb.cpp — Backend graphique FRAMEBUFFER (DMA → LCD) single-buffer robuste
 // ============================================================================
 //
-//  Version refondue et optimisée pour pipeline DMA propre.
-//  Toutes les écritures se font dans framebuffer[].
-//  lcd_refresh() déclenche le DMA (via LCD_FAST_test).
+//  Rôle principal :
+//    - Fournir des primitives graphiques de haut niveau (rectangles, sprites, texte…)
+//    - Écrire directement dans le framebuffer unique (partagé avec le DMA)
+//    - Encadrer les cycles de rendu avec des barrières DMA pour éviter toute corruption
+//    - Offrir des helpers begin/end frame pour un pipeline clair
+//    - Intégrer un suivi debug (compteurs, logs) pour mesurer la cadence et détecter frames perdues
 //
-//  Pipeline :
-//      1. gfx_fb_clear() / gfx_fb_putpixel() / gfx_fb_drawSprite()...
-//      2. gfx_fb_flush()
-//             → lcd_wait_for_dma()
-//             → lcd_wait_for_vsync()   (si activé)
-//             → lcd_start_dma()
-//
-//  Aucun accès direct au LCD ici.
-//  Aucune écriture concurrente pendant DMA.
+//  Notes importantes :
+//    - Pas de double buffering : on dessine directement dans le framebuffer
+//    - Toute écriture pendant un DMA est interdite (guarded_putpixel côté LCD.cpp)
+//    - gfx_fb_flush() impose pacing minimal et synchronisation stricte
 // ============================================================================
 
 #include "gfx_fb.h"
@@ -26,20 +24,73 @@
 #include "freertos/task.h"
 #include <algorithm>
 #include "assets/font8x8_basic.h"
+#include <inttypes.h>
 
 
-// Framebuffer réel défini dans LCD.cpp
-extern uint16_t framebuffer[320 * 240];
-
-// Couleur de texte active (utilisée par lcd_draw_str)
+// Framebuffer et couleur de texte définis dans LCD.cpp
+extern uint16_t* framebuffer;
 extern uint16_t current_text_color;
 
+// ============================================================================
+//  Module debug
+// ============================================================================
+static uint32_t dbg_flush_count   = 0;   // nombre de flush effectués
+static uint32_t dbg_skipped_frame = 0;   // frames "perdues" à cause du pacing
+static uint32_t dbg_last_delta    = 0;   // durée du dernier refresh
+
+// Affiche l’état debug actuel
+void gfx_fb_debugStatus() {
+    printf("[gfx_fb][debug] flush=%" PRIu32 " skipped=%" PRIu32 " last_delta=%" PRIu32 " ms\n",
+           dbg_flush_count, dbg_skipped_frame, dbg_last_delta);
+}
 
 // ============================================================================
 //  Initialisation
 // ============================================================================
 void gfx_fb_init() {
-    LCD_init();
+    LCD_init(); // initialise bus, framebuffer et pipeline DMA
+}
+
+// ============================================================================
+//  Flush robuste
+//  - Termine le DMA précédent
+//  - Attente VSYNC éventuelle
+//  - Pacing minimal (16 ms) pour éviter tearing
+//  - Met à jour les compteurs debug
+// ============================================================================
+void gfx_fb_flush() {
+    static uint32_t last_flush_ms = 0;
+    const uint32_t min_frame_ms = 16; // cible ~60 fps
+
+    lcd_wait_for_dma();
+    lcd_wait_for_vsync();
+
+    uint32_t now = millis();
+    if (now - last_flush_ms < min_frame_ms) {
+        // pacing : on ralentit volontairement
+        vTaskDelay((min_frame_ms - (now - last_flush_ms)) / portTICK_PERIOD_MS);
+        dbg_skipped_frame++;
+    }
+    last_flush_ms = millis();
+
+    lcd_start_dma();
+    dbg_flush_count++;
+    dbg_last_delta = LCD_last_refresh_delay();
+}
+
+// ============================================================================
+//  Helpers begin/end frame
+//  - Encadrent un cycle de rendu complet
+// ============================================================================
+void gfx_begin_frame() {
+    lcd_wait_for_dma();
+    lcd_wait_for_vsync();
+}
+
+void gfx_end_frame() {
+    lcd_start_dma();
+    dbg_flush_count++;
+    dbg_last_delta = LCD_last_refresh_delay();
 }
 
 
@@ -47,20 +98,17 @@ void gfx_fb_init() {
 //  Effacer l’écran
 // ============================================================================
 void gfx_fb_clear(uint16_t color) {
-    printf("[gfx_fb] clear color=0x%04X\n", color);
-    gfx_fb_fillFramebuffer(color);
+    for (int i = 0; i < SCREEN_W * SCREEN_H; ++i)
+        framebuffer[i] = color;
 }
 
-
 // ============================================================================
-//  Pixel → framebuffer
+//  Pixel
 // ============================================================================
 void gfx_fb_putpixel(int x, int y, uint16_t color) {
-    if ((unsigned)x >= SCREEN_W || (unsigned)y >= SCREEN_H)
-        return;
+    if ((unsigned)x >= SCREEN_W || (unsigned)y >= SCREEN_H) return;
     framebuffer[y * SCREEN_W + x] = color;
 }
-
 
 // ============================================================================
 //  Sprite simple
@@ -84,14 +132,12 @@ void gfx_fb_drawSprite(int x, int y,
     }
 }
 
-
 // ============================================================================
-//  Texte
+//  Texte basique
 // ============================================================================
 void gfx_fb_drawChar(int x, int y, char c, uint16_t color)
 {
     const uint8_t* glyph = font8x8_basic[(uint8_t)c];
-
     for (int row = 0; row < 8; row++) {
         uint8_t bits = glyph[row];
         for (int col = 0; col < 8; col++) {
@@ -111,26 +157,14 @@ void gfx_fb_text(int x, int y, const char* txt, uint16_t color)
     }
 }
 
-
-// ============================================================================
-//  Flush → DMA propre
-// ============================================================================
-void gfx_fb_flush() {
-	printf("[gfx_fb] flush\n");
-    lcd_wait_for_dma();
-    lcd_wait_for_vsync();
-    lcd_start_dma();
-}
-
-
 // ============================================================================
 //  Primitives géométriques
 // ============================================================================
-
 static inline void fb_plot(int x, int y, uint16_t color) {
     gfx_fb_putpixel(x, y, color);
 }
 
+// Trace une ligne avec Bresenham (algorithme classique de tracé de lignes en raster (inventé par Jack Bresenham en 1962))
 void gfx_fb_drawLine(int x0, int y0, int x1, int y1, uint16_t color) {
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
@@ -145,6 +179,7 @@ void gfx_fb_drawLine(int x0, int y0, int x1, int y1, uint16_t color) {
     }
 }
 
+// Trace un rectangle vide
 void gfx_fb_drawRect(int x, int y, int w, int h, uint16_t color) {
     gfx_fb_drawLine(x, y, x + w - 1, y, color);
     gfx_fb_drawLine(x, y + h - 1, x + w - 1, y + h - 1, color);
@@ -152,12 +187,15 @@ void gfx_fb_drawRect(int x, int y, int w, int h, uint16_t color) {
     gfx_fb_drawLine(x + w - 1, y, x + w - 1, y + h - 1, color);
 }
 
+
+// Dessine un rectangle rempli d'une couleur donnée
 void gfx_fb_fillRect(int x, int y, int w, int h, uint16_t color) {
     for (int yy = y; yy < y + h; ++yy)
         for (int xx = x; xx < x + w; ++xx)
             fb_plot(xx, yy, color);
 }
 
+// Trace un cercle (algorithme midpoint)
 void gfx_fb_drawCircle(int cx, int cy, int r, uint16_t color) {
     int f = 1 - r, ddf_x = 1, ddf_y = -2 * r;
     int x = 0, y = r;
@@ -182,6 +220,7 @@ void gfx_fb_drawCircle(int cx, int cy, int r, uint16_t color) {
     }
 }
 
+// Trace un cercle rempli d'une couleur
 void gfx_fb_fillCircle(int cx, int cy, int r, uint16_t color) {
     gfx_fb_drawLine(cx, cy - r, cx, cy + r, color);
 
@@ -199,6 +238,7 @@ void gfx_fb_fillCircle(int cx, int cy, int r, uint16_t color) {
     }
 }
 
+// Trace un triangle
 void gfx_fb_drawTriangle(int x0, int y0,
                          int x1, int y1,
                          int x2, int y2,
@@ -209,12 +249,12 @@ void gfx_fb_drawTriangle(int x0, int y0,
     gfx_fb_drawLine(x2, y2, x0, y0, color);
 }
 
+// Trace un triangle rempli d'une couleur
 void gfx_fb_fillTriangle(int x0, int y0,
                          int x1, int y1,
                          int x2, int y2,
                          uint16_t color)
 {
-    // Tri rempli simple (déjà correct dans ton code)
     if (y0 > y1) { std::swap(y0, y1); std::swap(x0, x1); }
     if (y1 > y2) { std::swap(y1, y2); std::swap(x1, x2); }
     if (y0 > y1) { std::swap(y0, y1); std::swap(x0, x1); }
@@ -247,6 +287,7 @@ void gfx_fb_fillTriangle(int x0, int y0,
     }
 }
 
+// Trace un rectangle arrondi
 void gfx_fb_drawRoundRect(int x, int y, int w, int h, int r, uint16_t color) {
     gfx_fb_drawRect(x + r, y, w - 2 * r, h, color);
     gfx_fb_drawRect(x, y + r, w, h - 2 * r, color);
@@ -256,6 +297,7 @@ void gfx_fb_drawRoundRect(int x, int y, int w, int h, int r, uint16_t color) {
     gfx_fb_drawCircle(x + w - r - 1, y + h - r - 1, r, color);
 }
 
+// Trace un rectangle arrondi rempli d'une couleur
 void gfx_fb_fillRoundRect(int x, int y, int w, int h, int r, uint16_t color) {
     gfx_fb_fillRect(x + r, y, w - 2 * r, h, color);
     gfx_fb_fillCircle(x + r, y + r, r, color);
@@ -266,9 +308,8 @@ void gfx_fb_fillRoundRect(int x, int y, int w, int h, int r, uint16_t color) {
 
 
 // ============================================================================
-//  Sprites avancés
+//  Sprites avancés (transparents, flips, rotations, scaling)
 // ============================================================================
-
 void gfx_fb_drawSpriteTransparent(int x, int y,
                                   const uint16_t* data,
                                   int w, int h,
@@ -422,15 +463,18 @@ void gfx_fb_blitTransparent(int dstX, int dstY,
 // ============================================================================
 //  Framebuffer utils
 // ============================================================================
+// Retourne le back buffer (zone de dessin)
 uint16_t* gfx_fb_getFramebuffer() {
     return framebuffer;
 }
 
+// Copie le back buffer vers dest
 void gfx_fb_copyFramebuffer(uint16_t* dest) {
     if (!dest) return;
     memcpy(dest, framebuffer, SCREEN_W * SCREEN_H * sizeof(uint16_t));
 }
 
+// Remplit le back buffer
 void gfx_fb_fillFramebuffer(uint16_t color) {
     for (int i = 0; i < SCREEN_W * SCREEN_H; ++i)
         framebuffer[i] = color;
@@ -462,6 +506,7 @@ void gfx_fb_textShadow(int x, int y,
 // ============================================================================
 //  Effets simples
 // ============================================================================
+// Clignotement écran : écrit dans back, flush chaque frame
 void gfx_fb_flashScreen(uint16_t color, int flashes) {
     for (int i = 0; i < flashes; ++i) {
         gfx_fb_clear(color);
@@ -470,6 +515,7 @@ void gfx_fb_flashScreen(uint16_t color, int flashes) {
     }
 }
 
+// Fade vers une couleur : calcule sur back, flush à chaque step
 void gfx_fb_fadeToColor(uint16_t color, int steps) {
     uint16_t* fb = framebuffer;
     const int total = SCREEN_W * SCREEN_H;
